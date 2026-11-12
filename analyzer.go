@@ -72,6 +72,11 @@ const (
 	directivePrefix                  = "//gosec:disable"
 )
 
+// noSecRuleIDPattern matches a single gosec rule ID (a 'G' followed by
+// exactly three digits) on word boundaries, so that malformed identifiers
+// such as G4012 or fooG401bar never match.
+var noSecRuleIDPattern = regexp.MustCompile(`\bG[0-9]{3}\b`)
+
 type ignore struct {
 	start        int
 	end          int
@@ -299,8 +304,15 @@ func (gosec *Analyzer) Process(buildTags []string, packagePaths ...string) error
 	results := make(chan result, len(packagePaths)) // Buffer for all potential results
 	jobs := make(chan string, len(packagePaths))
 
-	// Fill jobs channel and close it to signal no more work
+	// Fill jobs channel and close it to signal no more work. Each package
+	// path is scheduled only once: scanning the same path twice would
+	// report every issue and count every nosec directive multiple times.
+	seen := make(map[string]struct{}, len(packagePaths))
 	for _, pkgPath := range packagePaths {
+		if _, ok := seen[pkgPath]; ok {
+			continue
+		}
+		seen[pkgPath] = struct{}{}
 		jobs <- pkgPath
 	}
 	close(jobs)
@@ -845,7 +857,7 @@ func findNoSecDirective(group *ast.CommentGroup, noSecDefaultTag, noSecAlternati
 	// Check for directive comments individually
 	for _, c := range group.List {
 		if after, ok := strings.CutPrefix(c.Text, directivePrefix); ok {
-			if len(after) == 0 || after[0] == ' ' {
+			if len(after) == 0 || after[0] == ' ' || after[0] == '\t' {
 				return true, strings.TrimSpace(after)
 			}
 		}
@@ -955,17 +967,31 @@ func (v *astVisitor) updateIgnoredRulesForNode(n ast.Node) {
 			}
 		}
 
-		startLine := v.context.FileSet.File(startPos).Line(startPos)
-		endLine := v.context.FileSet.File(endPos).Line(endPos)
+		tokFile := v.context.FileSet.File(startPos)
+		if tokFile == nil {
+			return
+		}
+		// Issues are reported at //line-adjusted positions (see issue.New),
+		// so register the suppression in the same coordinate space. Otherwise
+		// a #nosec directive in a file with //line directives (e.g. cgo or
+		// generated code) would never match the issues it is meant to suppress.
+		start := tokFile.Position(startPos)
+		end := tokFile.Position(endPos)
+		file := start.Filename
+		startLine := start.Line
+		endLine := end.Line
+		if end.Filename != start.Filename || endLine < startLine {
+			// The range spans a //line directive boundary; fall back to the
+			// physical position so the suppression still applies.
+			file = tokFile.Name()
+			startLine = tokFile.Line(startPos)
+			endLine = tokFile.Line(endPos)
+		}
 		line := strconv.Itoa(startLine)
 		if startLine != endLine {
 			line = fmt.Sprintf("%d-%d", startLine, endLine)
 		}
-		v.context.Ignores.add(
-			v.context.FileSet.File(startPos).Name(),
-			line,
-			ignoredRules,
-		)
+		v.context.Ignores.add(file, line, ignoredRules)
 	}
 }
 
@@ -1000,7 +1026,6 @@ func (v *astVisitor) ignore(n ast.Node) (map[string]issue.SuppressionInfo, *ast.
 		if !found {
 			continue
 		}
-		v.stats.NumNosec++
 
 		justification := ""
 		hasJustificationDelim := false
@@ -1017,33 +1042,24 @@ func (v *astVisitor) ignore(n ast.Node) (map[string]issue.SuppressionInfo, *ast.
 			Justification: justification,
 		}
 
-		// Manually parse identifiers starting with 'G' followed by 3 digits.
 		// A directive that is empty or equals the legacy "block" keyword
-		// suppresses all rules.
+		// suppresses all rules. Any other directive must list rule IDs
+		// (a 'G' followed by exactly three digits) separated by whitespace
+		// and/or commas; tokens that are not valid rule IDs never expand
+		// to a suppression.
 		if len(directive) != 0 && directive != "block" {
-			for i := 0; i < len(directive); {
-				if directive[i] == 'G' && i+4 <= len(directive) {
-					ruleID := directive[i : i+4]
-					valid := true
-					for j := 1; j < 4; j++ {
-						if directive[i+j] < '0' || directive[i+j] > '9' {
-							valid = false
-							break
-						}
-					}
-					if valid {
-						ignores[ruleID] = suppression
-						i += 4
-						continue
-					}
-				}
-				i++
+			for _, ruleID := range noSecRuleIDPattern.FindAllString(directive, -1) {
+				ignores[ruleID] = suppression
 			}
 		}
 
 		naked := len(ignores) == 0
 		justificationMissing := !hasJustificationDelim || justification == ""
 
+		if naked && len(directive) != 0 && directive != "block" {
+			v.reportInvalidDirective(group, fmt.Sprintf("malformed rule list %q: expected rule IDs such as G401 separated by spaces or commas", directive))
+			continue
+		}
 		if requireRules && naked {
 			v.reportInvalidDirective(group, "missing rule ID (e.g. G401); naked #nosec / //gosec:disable is disallowed by -nosec-require-rules")
 			continue
@@ -1056,6 +1072,7 @@ func (v *astVisitor) ignore(n ast.Node) (map[string]issue.SuppressionInfo, *ast.
 		if naked {
 			ignores[aliasOfAllRules] = suppression
 		}
+		v.stats.NumNosec++
 		return ignores, group
 	}
 	return nil, nil
@@ -1077,10 +1094,15 @@ func (v *astVisitor) reportInvalidDirective(group *ast.CommentGroup, reason stri
 func (gosec *Analyzer) updateIssues(issue *issue.Issue, issues []*issue.Issue, stats *Metrics, allIgnores ignores) []*issue.Issue {
 	if issue != nil {
 		suppressions, ignored := getSuppressions(allIgnores, issue.File, issue.Line, issue.RuleID, gosec.ruleset, gosec.analyzerSet)
-		if gosec.showIgnored {
+		// Keep the nosec flag consistent with the suppression info whenever
+		// the issue is reported, so JSON/SARIF output does not show a
+		// suppressed issue as an active finding.
+		if gosec.showIgnored || gosec.trackSuppressions {
 			issue.NoSec = ignored
 		}
-		if !ignored || !gosec.showIgnored {
+		// Only unsuppressed issues count as findings; suppressed ones are
+		// either dropped or reported purely as tracked suppressions.
+		if !ignored {
 			stats.NumFound++
 		}
 		if ignored && gosec.trackSuppressions {
